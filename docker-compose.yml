@@ -1,0 +1,87 @@
+# Docker Compose for local development
+
+version: '3.9'
+
+services:
+
+  # Storage emulator
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    ports:
+      - "10000:10000"
+      - "10001:10001"
+    volumes:
+      - azurite_data:/data
+    environment:
+      AZURITE_ACCOUNTS: "devstoreaccount1:Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+
+  # Message broker
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+
+  # Database
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: bill_processing
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Cosmos DB local emulator (optional)
+  # cosmos-emulator:
+  #   image: mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:latest
+  #   ports:
+  #     - "8081:8081"
+  #   volumes:
+  #     - cosmos_data:/var/lib/cosmosdb
+
+  # Backend API
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=local
+      - SERVICE_BUS_CONNECTION=amqp://guest:guest@rabbitmq:5672/
+      - STORAGE_ACCOUNT_CONNECTION=DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1/;
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/bill_processing
+    volumes:
+      - ./src/backend-api:/app
+    depends_on:
+      - azurite
+      - rabbitmq
+      - postgres
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Frontend (optional)
+  frontend:
+    build:
+      context: src/frontend
+      dockerfile: ./Dockerfile
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./src/frontend/src:/app/src
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000
+
+volumes:
+  azurite_data:
+  postgres_data:
+  cosmos_data:
+
+networks:
+  default:
+    name: bill-processing-network

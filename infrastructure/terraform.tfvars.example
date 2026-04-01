@@ -1,0 +1,15 @@
+# terraform.tfvars.example
+# Copy to terraform.tfvars and fill in actual values
+
+subscription_id = "your-subscription-id"
+project_name   = "bill-processing"
+environment    = "dev"
+location       = "eastus"
+
+sql_admin_user     = "sqladmin"
+sql_admin_password = "YourSecurePassword123!"
+
+container_image_version = "1.0.0"
+app_service_sku        = "B2"
+aks_node_count         = 3
+aks_vm_size            = "Standard_B2s"

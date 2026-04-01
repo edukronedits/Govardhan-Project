@@ -1,0 +1,213 @@
+# Kubernetes Deployment Manifest for Bill Processing API
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bill-processing
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bill-processing
+  namespace: bill-processing
+  labels:
+    app: bill-processing
+    version: v1
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  
+  selector:
+    matchLabels:
+      app: bill-processing
+  
+  template:
+    metadata:
+      labels:
+        app: bill-processing
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    
+    spec:
+      serviceAccountName: bill-processing
+      
+      containers:
+      - name: bill-processing
+        image: billprocessingacr.azurecr.io/bill-processing:latest
+        imagePullPolicy: Always
+        
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        
+        env:
+        - name: ENVIRONMENT
+          value: "production"
+        - name: APPLICATION_INSIGHTS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: insights-key
+        
+        - name: SERVICE_BUS_CONNECTION
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: servicebus-connection
+        
+        - name: STORAGE_ACCOUNT_CONNECTION
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: storage-connection
+        
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+      
+      volumes:
+      - name: config
+        configMap:
+          name: bill-processing-config
+      
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - bill-processing
+              topologyKey: kubernetes.io/hostname
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bill-processing
+  namespace: bill-processing
+  labels:
+    app: bill-processing
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: http
+    protocol: TCP
+    name: http
+  
+  selector:
+    app: bill-processing
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: bill-processing-hpa
+  namespace: bill-processing
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: bill-processing
+  
+  minReplicas: 3
+  maxReplicas: 10
+  
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bill-processing
+  namespace: bill-processing
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: bill-processing
+  namespace: bill-processing
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bill-processing
+  namespace: bill-processing
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: bill-processing
+subjects:
+- kind: ServiceAccount
+  name: bill-processing
+  namespace: bill-processing
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bill-processing-config
+  namespace: bill-processing
+data:
+  log_level: "INFO"
+  max_workers: "4"
+  request_timeout: "30"

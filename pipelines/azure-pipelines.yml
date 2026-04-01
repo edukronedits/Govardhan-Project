@@ -1,0 +1,358 @@
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+    - feature/*
+  paths:
+    exclude:
+    - docs/
+    - '*.md'
+
+pr:
+  branches:
+    include:
+    - main
+    - develop
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  buildConfiguration: 'Release'
+  dockerRegistryServiceConnection: 'bill-processing-acr'
+  imageRepository: 'bill-processing'
+  containerRegistry: 'billprocessingacr.azurecr.io'
+  dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
+  tag: '$(Build.BuildId)'
+  PYTHON_VERSION: '3.11'
+
+stages:
+
+# ===== SOURCE STAGE =====
+- stage: Source
+  displayName: 'Source & Validation'
+  jobs:
+  - job: SourceValidation
+    displayName: 'Branch & PR Validation'
+    steps:
+    - checkout: self
+      fetchDepth: 0
+    
+    - script: |
+        echo "Branch: $(Build.SourceBranch)"
+        echo "Commit: $(Build.SourceVersion)"
+        echo "PR: $(System.PullRequest.PullRequestNumber)"
+      displayName: 'Display Build Info'
+    
+    - script: |
+        git log --oneline -10
+      displayName: 'Show Recent Commits'
+
+# ===== BUILD STAGE =====
+- stage: Build
+  displayName: 'Build & Package'
+  dependsOn: Source
+  jobs:
+  
+  - job: BuildBackend
+    displayName: 'Build Backend Services'
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(PYTHON_VERSION)'
+      displayName: 'Use Python $(PYTHON_VERSION)'
+    
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r src/backend-api/requirements.txt
+        pip install pytest pytest-cov black flake8
+      displayName: 'Install Dependencies'
+    
+    - script: |
+        black --check src/
+        flake8 src/ --max-line-length=100
+      displayName: 'Code Style Check'
+      continueOnError: true
+    
+    - script: |
+        cd src/backend-api
+        python -m pytest tests/ --junitxml=$(Common.TestResultsDirectory)/junit.xml --cov=. --cov-report=xml
+      displayName: 'Run Unit Tests'
+      continueOnError: true
+    
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFiles: '$(Common.TestResultsDirectory)/junit.xml'
+        testRunTitle: 'Backend Tests'
+      condition: always()
+      displayName: 'Publish Test Results'
+    
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/coverage.xml'
+      displayName: 'Publish Code Coverage'
+      continueOnError: true
+  
+  - job: BuildFrontend
+    displayName: 'Build Frontend'
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '18.x'
+      displayName: 'Use Node.js 18.x'
+    
+    - script: |
+        cd src/frontend
+        npm ci
+        npm run build
+      displayName: 'Build React App'
+    
+    - publish: $(System.DefaultWorkingDirectory)/src/frontend/dist
+      artifact: 'frontend-dist'
+      displayName: 'Publish Frontend Build'
+
+# ===== CODE QUALITY STAGE =====
+- stage: CodeQuality
+  displayName: 'Code Quality & Analysis'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  
+  - job: SonarQubeAnalysis
+    displayName: 'SonarQube Analysis'
+    steps:
+    - task: SonarQubePrepare@5
+      inputs:
+        SonarQube: 'SonarQube'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'com.billprocessing:api'
+        cliProjectName: 'Bill Processing API'
+        cliSources: 'src/'
+        extraProperties: |
+          sonar.python.coverage.reportPaths=$(System.DefaultWorkingDirectory)/coverage.xml
+      displayName: 'SonarQube Prepare'
+    
+    - task: SonarQubeAnalyze@5
+      displayName: 'SonarQube Analyze'
+    
+    - task: SonarQubePublish@5
+      inputs:
+        pollingTimeoutSec: '300'
+      displayName: 'SonarQube Publish'
+
+# ===== SECURITY STAGE =====
+- stage: Security
+  displayName: 'Security Scanning'
+  dependsOn: CodeQuality
+  condition: succeeded()
+  jobs:
+  
+  - job: DependencyScan
+    displayName: 'Dependency Vulnerability Scan'
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(PYTHON_VERSION)'
+    
+    - script: |
+        pip install safety bandit
+        safety check --json > safety-report.json || true
+        bandit -r src/ -f json -o bandit-report.json || true
+      displayName: 'Run Dependency Scan'
+    
+    - publish: $(System.DefaultWorkingDirectory)/safety-report.json
+      artifact: 'security-reports'
+      displayName: 'Publish Security Reports'
+  
+  - job: ContainerScan
+    displayName: 'Container Image Vulnerability Scan'
+    steps:
+    - script: |
+        docker build -t $(containerRegistry)/$(imageRepository):$(tag) .
+        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          aquasec/trivy image --severity HIGH,CRITICAL \
+          $(containerRegistry)/$(imageRepository):$(tag)
+      displayName: 'Trivy Scan'
+      continueOnError: true
+
+# ===== PUSH IMAGE STAGE =====
+- stage: PushImage
+  displayName: 'Push Container Image'
+  dependsOn: Security
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  
+  - job: PushACR
+    displayName: 'Push to Azure Container Registry'
+    steps:
+    - task: Docker@2
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+          latest
+      displayName: 'Build & Push Docker Image'
+    
+    - script: |
+        echo "##vso[task.setvariable variable=imageTag]$(tag)"
+      displayName: 'Set Image Tag Variable'
+
+# ===== INFRASTRUCTURE STAGE =====
+- stage: Infrastructure
+  displayName: 'Infrastructure as Code'
+  dependsOn: PushImage
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  
+  - job: TerraformDeploy
+    displayName: 'Terraform Plan & Apply'
+    steps:
+    - task: TerraformInstaller@0
+      inputs:
+        terraformVersion: '1.5.0'
+      displayName: 'Install Terraform'
+    
+    - task: TerraformTaskV4@4
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+        backendServiceArm: 'Azure-Subscription'
+        backendAzureRmResourceGroupName: 'tf-state-rg'
+        backendAzureRmStorageAccountName: 'tfstatesa'
+        backendAzureRmContainerName: 'tfstate'
+        backendAzureRmKey: 'bill-processing.tfstate'
+      displayName: 'Terraform Init'
+    
+    - task: TerraformTaskV4@4
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+        commandOptions: '-var-file=terraform.tfvars'
+        environmentServiceNameAzureRM: 'Azure-Subscription'
+      displayName: 'Terraform Plan'
+    
+    - task: TerraformTaskV4@4
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+        commandOptions: '-auto-approve -var-file=terraform.tfvars'
+        environmentServiceNameAzureRM: 'Azure-Subscription'
+      displayName: 'Terraform Apply'
+      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
+# ===== DEPLOYMENT STAGE =====
+- stage: Deploy
+  displayName: 'Deploy Services'
+  dependsOn: Infrastructure
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  
+  - job: DeployAKS
+    displayName: 'Deploy to AKS'
+    steps:
+    - task: KubectlInstaller@0
+      displayName: 'Install kubectl'
+    
+    - task: HelmInstaller@0
+      inputs:
+        helmVersion: '3.12.0'
+      displayName: 'Install Helm'
+    
+    - task: KubernetesManifest@0
+      inputs:
+        action: 'deploy'
+        kubernetesServiceConnection: 'bill-processing-aks'
+        namespace: 'default'
+        manifests: |
+          $(System.DefaultWorkingDirectory)/k8s/deployment.yaml
+          $(System.DefaultWorkingDirectory)/k8s/service.yaml
+      displayName: 'Deploy Kubernetes Manifests'
+    
+    - script: |
+        kubectl set image deployment/bill-processing \
+          bill-processing=$(containerRegistry)/$(imageRepository):$(imageTag) \
+          --record -n default
+      displayName: 'Update Container Image'
+  
+  - job: DeployAppService
+    displayName: 'Deploy Backend API'
+    steps:
+    - task: AzureWebApp@1
+      inputs:
+        azureSubscription: 'Azure-Subscription'
+        appType: 'webAppLinux'
+        appName: 'bill-processing-api'
+        package: '$(Pipeline.Workspace)/backend'
+      displayName: 'Deploy to App Service'
+  
+  - job: DeployFrontend
+    displayName: 'Deploy Frontend'
+    steps:
+    - download: current
+      artifact: 'frontend-dist'
+    
+    - task: AzureStaticWebApp@0
+      inputs:
+        azure_static_web_apps_api_token: '$(swa_token)'
+        app_location: '$(Pipeline.Workspace)/frontend-dist'
+        output_location: ''
+      displayName: 'Deploy to Static Web Apps'
+
+# ===== POST DEPLOYMENT STAGE =====
+- stage: PostDeployment
+  displayName: 'Post-Deployment Validation'
+  dependsOn: Deploy
+  condition: succeeded()
+  jobs:
+  
+  - job: HealthChecks
+    displayName: 'Health & Smoke Tests'
+    steps:
+    - script: |
+        curl -f https://bill-processing-api.azurewebsites.net/health || exit 1
+        echo "✓ API health check passed"
+      displayName: 'API Health Check'
+    
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: 'Azure-Subscription'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az aks get-credentials -g bill-processing-rg -n bill-processing-aks
+          kubectl rollout status deployment/bill-processing -n default
+      displayName: 'AKS Deployment Status'
+
+# ===== MONITORING STAGE =====
+- stage: Monitoring
+  displayName: 'Monitoring & Alerts'
+  dependsOn: PostDeployment
+  condition: succeeded()
+  jobs:
+  
+  - job: EnableMonitoring
+    displayName: 'Configure Monitoring'
+    steps:
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: 'Azure-Subscription'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az monitor metrics-alert create \
+            --resource-group bill-processing-rg \
+            --scopes /subscriptions/xxx/resourceGroups/bill-processing-rg \
+            --description "API high latency alert" \
+            --evaluation-frequency 1m \
+            --window-size 5m \
+            --condition "avg ResponseTime > 2000"
+      displayName: 'Create Monitoring Alerts'
